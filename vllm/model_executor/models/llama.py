@@ -227,6 +227,18 @@ class LlamaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+
+        from vllm._kvlobotomy import KVLOBOTOMY_PRE_ROPE
+        if KVLOBOTOMY_PRE_ROPE:
+            from vllm._kvlobotomy import set_rope_context
+            set_rope_context(
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.rotary_dim,
+                self.rotary_emb.head_size,
+                self.rotary_emb.is_neox_style,
+            )
+
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output

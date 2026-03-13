@@ -165,6 +165,10 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         # key may be None in some cases, e.g. cross-layer KV sharing
+        from vllm._kvlobotomy import KVLOBOTOMY_PRE_ROPE
+        if KVLOBOTOMY_PRE_ROPE:
+            return query, key
+
         if key is not None:
             key_shape = key.shape
             key = key.view(num_tokens, -1, head_size)
@@ -203,6 +207,15 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        from vllm._kvlobotomy import KVLOBOTOMY_PRE_ROPE
+        if KVLOBOTOMY_PRE_ROPE:
+            cos_sin_cache = self._match_cos_sin_cache_dtype(query)
+            return self.forward_static(
+                positions, query, key,
+                self.head_size, self.rotary_dim,
+                cos_sin_cache, self.is_neox_style,
+            )
+
         if self.use_flashinfer:
             torch.ops.vllm.flashinfer_rotary_embedding(
                 positions,

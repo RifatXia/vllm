@@ -442,6 +442,12 @@ class Attention(nn.Module, AttentionLayerBase):
                     kv_cache_dummy_dep = unified_kv_cache_update(
                         key, value, self.layer_name
                     )
+
+                from vllm._kvlobotomy import KVLOBOTOMY_PRE_ROPE
+                if KVLOBOTOMY_PRE_ROPE and key is not None:
+                    from vllm._kvlobotomy import apply_rope_to_key
+                    key = apply_rope_to_key(key)
+
                 unified_attention_with_output(
                     query,
                     key,
@@ -461,6 +467,12 @@ class Attention(nn.Module, AttentionLayerBase):
                     kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
                         key, value, self.layer_name
                     )
+
+                from vllm._kvlobotomy import KVLOBOTOMY_PRE_ROPE as _PRE_ROPE
+                if _PRE_ROPE and key is not None:
+                    from vllm._kvlobotomy import apply_rope_to_key
+                    key = apply_rope_to_key(key)
+
                 torch.ops.vllm.unified_attention_with_output(
                     query,
                     key,
