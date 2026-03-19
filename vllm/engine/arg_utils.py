@@ -628,6 +628,8 @@ class EngineArgs:
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
 
+    rope_storage: str = ModelConfig.rope_storage
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -761,6 +763,9 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--io-processor-plugin", **model_kwargs["io_processor_plugin"]
+        )
+        model_group.add_argument(
+            "--rope-storage", **model_kwargs["rope_storage"]
         )
 
         # Model loading arguments
@@ -1424,6 +1429,7 @@ class EngineArgs:
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,
             io_processor_plugin=self.io_processor_plugin,
+            rope_storage=self.rope_storage,
         )
 
     def validate_tensorizer_args(self):

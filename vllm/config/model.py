@@ -287,6 +287,12 @@ class ModelConfig:
     io_processor_plugin: str | None = None
     """IOProcessor plugin name to load at model startup"""
 
+    # KVLobotomy: RoPE storage mode
+    rope_storage: str = "post"
+    """Controls when RoPE rotation is applied relative to KV cache storage.
+    'post' (default): Keys are rotated before storage (standard vLLM behavior).
+    'pre': Keys are stored unrotated; RoPE is applied at attention time."""
+
     # Pooler config
     pooler_config: PoolerConfig | None = None
     """Pooler config which controls the behaviour of output pooling in pooling

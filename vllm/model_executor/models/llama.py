@@ -161,6 +161,9 @@ class LlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
 
+        # KVLobotomy: rope_storage mode (set by LlamaDecoderLayer after init)
+        self.rope_storage = "post"
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_size=self.head_dim,
@@ -227,9 +230,145 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        if self.rope_storage == "pre":
+            # During profiling/warmup, the KV cache or forward context may
+            # not be ready. Fall back to standard path in those cases.
+            from vllm.forward_context import is_forward_context_available
+            kv_cache_tensor = self.attn.kv_cache[0]
+            if (
+                kv_cache_tensor.numel() > 0
+                and is_forward_context_available()
+            ):
+                try:
+                    return self._forward_pre_rope(positions, q, k, v)
+                except (AttributeError, TypeError):
+                    pass  # Fall through to standard path
+            # Fall through to standard path if not ready
+
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
+        return output
+
+    def _forward_pre_rope(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass with pre-RoPE storage: keys stored unrotated in cache.
+
+        Steps:
+        1. Apply RoPE to Q only
+        2. Store unrotated K in KV cache
+        3. Rotate all cached K in-place (including just-stored)
+        4. Compute attention (kernel reads rotated K)
+        5. Restore unrotated K in cache
+        6. Project output
+        """
+        from vllm.forward_context import get_forward_context
+        from vllm.model_executor.layers.attention.attention import (
+            get_attention_context,
+        )
+
+        # Apply RoPE to Q only (K stays unrotated for storage)
+        q, _ = self.rotary_emb(positions, q, None)
+
+        # Reshape for attention ops
+        num_tokens = q.shape[0]
+        q = q.view(num_tokens, self.num_heads, self.head_dim)
+        k = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+        v = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+
+        # Get attention context for low-level ops
+        layer_name = self.attn.layer_name
+        attn_metadata, attn_layer, kv_cache, layer_slot_mapping = (
+            get_attention_context(layer_name)
+        )
+
+        # If attn_metadata is None (warmup/profiling), fall back to
+        # standard attention path with rotated K
+        if attn_metadata is None:
+            q_flat = q.view(num_tokens, -1)
+            k_flat = k.view(num_tokens, -1)
+            # Rotate K for this fallback path
+            _, k_rot = self.rotary_emb(positions, q_flat, k_flat)
+            k = k_rot.view(num_tokens, self.num_kv_heads, self.head_dim)
+            q = q_flat.view(num_tokens, self.num_heads, self.head_dim)
+            attn_output = self.attn(
+                q.view(num_tokens, -1), k.view(num_tokens, -1),
+                v.view(num_tokens, -1)
+            )
+            output, _ = self.o_proj(attn_output)
+            return output
+
+        # Step 2: Store unrotated K in cache
+        if (
+            layer_slot_mapping is not None
+            and hasattr(attn_layer.impl, "do_kv_cache_update")
+        ):
+            attn_layer.impl.do_kv_cache_update(
+                attn_layer, k, v, kv_cache, layer_slot_mapping
+            )
+
+        # Step 3: Rotate all cached K in-place
+        # KV cache shape: [2, num_blocks, block_size, num_kv_heads, head_dim]
+        key_cache = kv_cache[0]  # [num_blocks, block_size, kv_heads, head_dim]
+        block_size = key_cache.shape[1]
+        seq_lens = attn_metadata.seq_lens
+        block_table = attn_metadata.block_table
+
+        saved_keys = []
+        for req_idx in range(seq_lens.shape[0]):
+            total_tokens = seq_lens[req_idx].item()
+            if total_tokens == 0:
+                continue
+
+            all_positions = torch.arange(
+                total_tokens, device=key_cache.device, dtype=torch.long
+            )
+            logical_blocks = all_positions // block_size
+            block_offsets = all_positions % block_size
+            physical_blocks = block_table[req_idx, logical_blocks]
+
+            # Extract unrotated K (fancy indexing creates a copy)
+            cached_k = key_cache[physical_blocks, block_offsets]
+
+            # Save for restoration after attention
+            saved_keys.append(
+                (req_idx, physical_blocks, block_offsets, cached_k)
+            )
+
+            # Apply RoPE to cached K
+            # rotary_emb.forward_native returns new tensors (not in-place)
+            _, rotated_k = self.rotary_emb.forward_native(
+                all_positions, cached_k.clone(), cached_k.clone()
+            )
+
+            # Write rotated K back to cache
+            key_cache[physical_blocks, block_offsets] = rotated_k
+
+        # Step 4: Compute attention (reads rotated K from cache)
+        output = torch.empty(
+            num_tokens,
+            self.num_heads,
+            self.head_dim,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        attn_layer.impl.forward(
+            attn_layer, q, k, v, kv_cache, attn_metadata, output=output
+        )
+
+        # Step 5: Restore unrotated K in cache
+        for req_idx, physical_blocks, block_offsets, cached_k in saved_keys:
+            key_cache[physical_blocks, block_offsets] = cached_k
+
+        # Step 6: Project output
+        output = output.view(num_tokens, -1)
+        output, _ = self.o_proj(output)
         return output
 
     def _init_rotary_emb(
@@ -300,6 +439,10 @@ class LlamaDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
         )
+        # KVLobotomy: propagate rope_storage mode to attention layer
+        rope_storage = getattr(vllm_config.model_config, "rope_storage", "post")
+        self.self_attn.rope_storage = rope_storage
+
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
