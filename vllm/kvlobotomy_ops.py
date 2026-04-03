@@ -206,13 +206,21 @@ def kvlobotomy_delete(worker, delete_start, delete_end, rope_storage,
 
 def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
                             rope_theta, head_dim, num_kv_heads, total_seq_len):
-    """Full delete: remove segment B and compact C+D into place.
+    """Full delete: remove segment B, compact remaining tokens, zero stale tail.
 
-    Unlike kvlobotomy_delete() which only does RoPE correction, this function
-    actually moves C+D's keys AND values to fill the gap left by B.
+    Unlike kvlobotomy_delete() which only simulates RoPE correction cost, this
+    function actually removes B from the KV cache:
 
-    For post-RoPE: delta-rotate C+D's keys, then copy keys+values.
-    For pre-RoPE: copy keys+values only (no rotation needed).
+    1. Read C+suffix keys/values from their current positions
+    2. For post-RoPE: delta-rotate C+suffix keys by -len(B) positions
+    3. Write C+suffix to compacted positions (filling B's gap)
+    4. Zero out the stale tail (old positions that are now unused)
+
+    For pre-RoPE: step 2 is skipped (keys have no position encoding).
+
+    After this function returns, the caller MUST reset the prefix cache
+    hash table to prevent stale hash entries from causing incorrect cache
+    hits in subsequent requests.
 
     Args:
         worker: vLLM worker object (provides access to kv_caches)
@@ -225,51 +233,49 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
         total_seq_len: total sequence length before deletion
 
     Returns:
-        dict with deletion_latency_ms, rotation_ms, copy_ms, and metadata
+        dict with deletion_latency_ms, rotation_ms, copy_ms, new_seq_len,
+        and metadata
     """
     torch.cuda.synchronize()
     start_time = time.perf_counter()
 
     delete_len = delete_end - delete_start
-    tokens_after = total_seq_len - delete_end  # C+D tokens to move
+    tokens_after = total_seq_len - delete_end  # C+suffix tokens to move
+    new_seq_len = total_seq_len - delete_len
 
     rotation_ms = 0.0
     copy_ms = 0.0
 
-    if tokens_after > 0:
-        kv_caches = worker.model_runner.kv_caches
+    kv_caches = worker.model_runner.kv_caches
 
-        for layer_idx, kv_cache in enumerate(kv_caches):
-            key_cache = kv_cache[0]   # [num_blocks, block_size, kv_heads, head_dim]
-            val_cache = kv_cache[1]   # [num_blocks, block_size, kv_heads, head_dim]
-            block_size = key_cache.shape[1]
+    for layer_idx, kv_cache in enumerate(kv_caches):
+        key_cache = kv_cache[0]   # [num_blocks, block_size, kv_heads, head_dim]
+        val_cache = kv_cache[1]   # [num_blocks, block_size, kv_heads, head_dim]
+        block_size = key_cache.shape[1]
 
-            # Source positions (where C+D currently are)
+        torch.cuda.synchronize()
+        t_copy_start = time.perf_counter()
+
+        if tokens_after > 0:
+            # Source positions (where C+suffix currently are)
             old_positions = torch.arange(
                 delete_end, total_seq_len,
                 device=key_cache.device, dtype=torch.long,
             )
-            # Destination positions (where C+D should go after compaction)
+            # Destination positions (where they go after compaction)
             new_positions = old_positions - delete_len
 
-            # Map to block addresses
+            # Map to block addresses (identity for single-request)
             old_blocks = old_positions // block_size
             old_offsets = old_positions % block_size
             new_blocks = new_positions // block_size
             new_offsets = new_positions % block_size
 
-            # For single-request experiment: block table is identity
-            old_phys = old_blocks
-            new_phys = new_blocks
+            # Gather C+suffix keys and values (fancy indexing = copy)
+            c_keys = key_cache[old_blocks, old_offsets]
+            c_vals = val_cache[old_blocks, old_offsets]
 
-            # Gather C+D's keys and values from old locations
-            torch.cuda.synchronize()
-            t_copy_start = time.perf_counter()
-
-            c_keys = key_cache[old_phys, old_offsets]  # [N, kv_heads, head_dim]
-            c_vals = val_cache[old_phys, old_offsets]  # [N, kv_heads, head_dim]
-
-            # Post-RoPE: delta-rotate C+D's keys before placing them
+            # Post-RoPE: delta-rotate keys to correct positions
             if rope_storage == "post":
                 torch.cuda.synchronize()
                 t_rot_start = time.perf_counter()
@@ -282,13 +288,25 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
                 t_rot_end = time.perf_counter()
                 rotation_ms += (t_rot_end - t_rot_start) * 1000.0
 
-            # Scatter C+D's data to new (compacted) locations
-            key_cache[new_phys, new_offsets] = c_keys
-            val_cache[new_phys, new_offsets] = c_vals
+            # Scatter to compacted positions
+            key_cache[new_blocks, new_offsets] = c_keys
+            val_cache[new_blocks, new_offsets] = c_vals
 
-            torch.cuda.synchronize()
-            t_copy_end = time.perf_counter()
-            copy_ms += (t_copy_end - t_copy_start) * 1000.0
+        # Zero out stale tail: positions [new_seq_len, total_seq_len)
+        # Prevents any residual data from being accessible
+        stale_positions = torch.arange(
+            new_seq_len, total_seq_len,
+            device=key_cache.device, dtype=torch.long,
+        )
+        if len(stale_positions) > 0:
+            stale_blocks = stale_positions // block_size
+            stale_offsets = stale_positions % block_size
+            key_cache[stale_blocks, stale_offsets] = 0
+            val_cache[stale_blocks, stale_offsets] = 0
+
+        torch.cuda.synchronize()
+        t_copy_end = time.perf_counter()
+        copy_ms += (t_copy_end - t_copy_start) * 1000.0
 
     torch.cuda.synchronize()
     end_time = time.perf_counter()
@@ -303,6 +321,7 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
         "copy_ms": copy_only_ms,
         "total_tokens_moved": tokens_after,
         "total_tokens_deleted": delete_len,
+        "new_seq_len": new_seq_len,
         "rope_storage": rope_storage,
         "delete_start": delete_start,
         "delete_end": delete_end,
