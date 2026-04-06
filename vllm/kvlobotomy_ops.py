@@ -205,7 +205,8 @@ def kvlobotomy_delete(worker, delete_start, delete_end, rope_storage,
 
 
 def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
-                            rope_theta, head_dim, num_kv_heads, total_seq_len):
+                            rope_theta, head_dim, num_kv_heads, total_seq_len,
+                            block_table=None):
     """Full delete: remove segment B, compact remaining tokens, zero stale tail.
 
     Unlike kvlobotomy_delete() which only simulates RoPE correction cost, this
@@ -218,9 +219,9 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
 
     For pre-RoPE: step 2 is skipped (keys have no position encoding).
 
-    After this function returns, the caller MUST reset the prefix cache
-    hash table to prevent stale hash entries from causing incorrect cache
-    hits in subsequent requests.
+    After this function returns, the caller MUST heal or reset the prefix
+    cache hash table to prevent stale hash entries from causing incorrect
+    cache hits in subsequent requests.
 
     Args:
         worker: vLLM worker object (provides access to kv_caches)
@@ -231,6 +232,11 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
         head_dim: attention head dimension
         num_kv_heads: number of KV heads
         total_seq_len: total sequence length before deletion
+        block_table: list of physical block IDs mapping logical block index
+            to physical block in the KV cache tensor. If None, uses identity
+            mapping (logical == physical). Must be provided when the physical
+            block allocation doesn't start from 0 (which is typical in vLLM
+            since block 0 is the null block).
 
     Returns:
         dict with deletion_latency_ms, rotation_ms, copy_ms, new_seq_len,
@@ -248,10 +254,21 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
 
     kv_caches = worker.model_runner.kv_caches
 
+    # Build physical block mapping tensor once (shared across layers).
+    # The block_table maps logical block index -> physical block ID.
+    # If not provided, falls back to identity mapping.
+    _bt_tensor = None  # lazily built on first layer
+
     for layer_idx, kv_cache in enumerate(kv_caches):
         key_cache = kv_cache[0]   # [num_blocks, block_size, kv_heads, head_dim]
         val_cache = kv_cache[1]   # [num_blocks, block_size, kv_heads, head_dim]
         block_size = key_cache.shape[1]
+
+        # Build block table tensor on first layer (same for all layers)
+        if _bt_tensor is None and block_table is not None:
+            _bt_tensor = torch.tensor(
+                block_table, device=key_cache.device, dtype=torch.long,
+            )
 
         torch.cuda.synchronize()
         t_copy_start = time.perf_counter()
@@ -265,11 +282,18 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
             # Destination positions (where they go after compaction)
             new_positions = old_positions - delete_len
 
-            # Map to block addresses (identity for single-request)
-            old_blocks = old_positions // block_size
+            # Map logical block indices to physical block IDs
+            old_logical = old_positions // block_size
             old_offsets = old_positions % block_size
-            new_blocks = new_positions // block_size
+            new_logical = new_positions // block_size
             new_offsets = new_positions % block_size
+
+            if _bt_tensor is not None:
+                old_blocks = _bt_tensor[old_logical]
+                new_blocks = _bt_tensor[new_logical]
+            else:
+                old_blocks = old_logical
+                new_blocks = new_logical
 
             # Gather C+suffix keys and values (fancy indexing = copy)
             c_keys = key_cache[old_blocks, old_offsets]
@@ -299,8 +323,12 @@ def kvlobotomy_full_delete(worker, delete_start, delete_end, rope_storage,
             device=key_cache.device, dtype=torch.long,
         )
         if len(stale_positions) > 0:
-            stale_blocks = stale_positions // block_size
+            stale_logical = stale_positions // block_size
             stale_offsets = stale_positions % block_size
+            if _bt_tensor is not None:
+                stale_blocks = _bt_tensor[stale_logical]
+            else:
+                stale_blocks = stale_logical
             key_cache[stale_blocks, stale_offsets] = 0
             val_cache[stale_blocks, stale_offsets] = 0
 

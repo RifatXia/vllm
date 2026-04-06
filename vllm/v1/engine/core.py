@@ -195,11 +195,13 @@ class EngineCore:
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
+        self.caching_hash_fn: Callable[[Any], bytes] | None = None
         if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
             init_none_hash(caching_hash_fn)
+            self.caching_hash_fn = caching_hash_fn
 
             self.request_block_hasher = get_request_block_hasher(
                 scheduler_block_size, caching_hash_fn
