@@ -20,6 +20,123 @@ import torch
 import torch.nn.functional as F
 
 
+def score_prompt_to_context_attention_l0(worker, token_ids, block_table,
+                                         prompt_positions, context_positions):
+    """Rank context tokens by layer-0 prompt-to-context attention.
+
+    This is the small, LLaMA-family selector used by the M7 InfoFlow-KV
+    adaptation in ``tests/15-best-method-with-fix``. It computes each prompt
+    token's *actual layer-0 query* at its global RoPE position, attends it to
+    the post-edit context keys, averages over query heads, and sums the
+    resulting attention mass over prompt tokens.
+
+    It intentionally exposes a narrow first implementation: it is
+    query-conditioned and uses the final global RoPE geometry, but it is not
+    the paper's full intermediate-layer (e.g. 22--25) scorer.  A later
+    implementation can extend this by forwarding prompt hidden states through
+    prior layers without changing the returned score contract.
+
+    Args:
+        worker: vLLM GPU worker supplied by ``collective_rpc``.
+        token_ids: token IDs for the eventual context-plus-question sequence.
+        block_table: physical block table for that sequence.
+        prompt_positions: global positions of question tokens in the eventual
+            context-plus-question sequence.  They need not yet be cached.
+        context_positions: global positions eligible for recomputation.
+
+    Returns:
+        A dictionary whose ``scores`` are CPU floats aligned with
+        ``context_positions``.  The caller is responsible for taking top-k.
+    """
+    if not prompt_positions:
+        raise ValueError("prompt_positions must be non-empty")
+    if not context_positions:
+        raise ValueError("context_positions must be non-empty")
+
+    model_runner = worker.model_runner
+    llama_model = model_runner.model.model
+    layer = llama_model.layers[0]
+    if not hasattr(layer, "input_layernorm"):
+        raise NotImplementedError(
+            "The InfoFlow L0 smoke scorer currently supports pre-norm "
+            "LLaMA-family layers only.")
+
+    kv_caches = model_runner.kv_caches
+    key_cache = kv_caches[0][0]
+    block_size = key_cache.shape[1]
+    device = key_cache.device
+    prompt_positions_t = torch.tensor(prompt_positions, device=device,
+                                      dtype=torch.long)
+    context_positions_t = torch.tensor(context_positions, device=device,
+                                       dtype=torch.long)
+    token_ids_t = torch.tensor(
+        [token_ids[p] for p in prompt_positions], device=device,
+        dtype=torch.long)
+
+    # At layer 0 the prompt query is obtained from its token embedding and
+    # pre-attention norm; the prompt's global RoPE position is then applied.
+    hidden_states = llama_model.embed_tokens(token_ids_t)
+    attn_input = layer.input_layernorm(hidden_states)
+    qkv, _ = layer.self_attn.qkv_proj(attn_input)
+    q_size = layer.self_attn.q_size
+    kv_size = layer.self_attn.kv_size
+    q, k, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    q, _ = layer.self_attn.rotary_emb(prompt_positions_t, q, k)
+
+    num_q_heads = layer.self_attn.num_heads
+    num_kv_heads = key_cache.shape[2]
+    head_dim = key_cache.shape[3]
+    if num_q_heads % num_kv_heads:
+        raise ValueError(
+            f"Unsupported GQA layout: {num_q_heads} Q heads / "
+            f"{num_kv_heads} KV heads")
+    q = q.view(len(prompt_positions), num_q_heads, head_dim)
+
+    block_table_t = torch.tensor(block_table, device=device, dtype=torch.long)
+    logical_blocks = context_positions_t // block_size
+    offsets = context_positions_t % block_size
+    physical_blocks = block_table_t[logical_blocks]
+    context_keys = key_cache[physical_blocks, offsets]
+    # Expand KV heads to Q heads for grouped-query attention.
+    context_keys = context_keys.repeat_interleave(
+        num_q_heads // num_kv_heads, dim=1)
+
+    # [prompt, heads, context].  The softmax is over all eligible context
+    # tokens, which is the document-token portion InfoFlow ranks.
+    logits = torch.einsum("phd,chd->phc", q.float(), context_keys.float())
+    logits.mul_(head_dim ** -0.5)
+    attention = F.softmax(logits, dim=-1).mean(dim=1)
+    scores = attention.sum(dim=0)
+    return {
+        "scores": scores.cpu(),
+        "context_positions": list(context_positions),
+        "prompt_positions": list(prompt_positions),
+        "layer": 0,
+    }
+
+
+def select_infoflow_candidates(score_result, ratio=0.15):
+    """Return global context positions with the largest InfoFlow scores.
+
+    ``score_prompt_to_context_attention_l0`` deliberately returns scores on
+    CPU so this small, deterministic top-k operation does not retain GPU
+    tensors between collective-RPC calls.  Unlike ``select_repair_candidates``
+    (the multi-layer attention-to-B diagnostic), this selects exactly one
+    global top-k set: the InfoFlow-KV policy.
+    """
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError(f"InfoFlow ratio must be in (0, 1], got {ratio}")
+    scores = torch.as_tensor(score_result["scores"])
+    positions = list(score_result["context_positions"])
+    if scores.numel() != len(positions):
+        raise ValueError("InfoFlow scores and context positions disagree")
+    if not positions:
+        return []
+    k = min(len(positions), max(1, int(len(positions) * ratio)))
+    selected = torch.topk(scores, k=k, largest=True, sorted=False).indices.tolist()
+    return sorted(positions[index] for index in selected)
+
+
 def diagnose_attention_to_b(worker, abc_token_count, b_start, b_end,
                              block_table, diag_layers=None, chunk_size=512,
                              _profile=False):
