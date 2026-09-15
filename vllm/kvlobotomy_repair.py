@@ -115,6 +115,156 @@ def score_prompt_to_context_attention_l0(worker, token_ids, block_table,
     }
 
 
+def score_prompt_to_context_attention(worker, token_ids, block_table,
+                                      prompt_positions, context_positions,
+                                      score_layers=(22, 23, 24, 25)):
+    """InfoFlow-KV prompt-to-context attention-norm scorer at chosen layers.
+
+    This is the paper-faithful selector for the M7 adaptation (InfoFlow KV,
+    Teng et al. 2026, Sec. 3 and App. F): the prompt tokens are forwarded
+    through the model against the current paged cache, and at each scoring
+    layer the attention mass each prompt token places on each candidate
+    context token is accumulated.  The paper scores at layers 22--25 and
+    uses that band for every model, Llama-3.1-8B included.
+
+    Mechanics per layer ``l <= max(score_layers)``:
+      * gather the cached K/V of every position before the prompt from the
+        paged cache (the post-edit context at its final global positions);
+      * compute the prompt tokens' own Q/K/V with global RoPE positions;
+      * attend with a mask that is full over the cached prefix and causal
+        inside the prompt (exactly what decoding would see);
+      * at scoring layers, take softmax over the *full* row, read the columns
+        at ``context_positions``, average over query heads, and sum over
+        prompt tokens;
+      * carry the prompt hidden states forward through o_proj/MLP.
+
+    Nothing is written to the cache.  The prompt is short, so this costs a
+    handful of small matmuls per layer.
+
+    Args:
+        worker: vLLM GPU worker supplied by ``collective_rpc``.
+        token_ids: token IDs of the eventual context-plus-prompt sequence.
+        block_table: physical block table for that sequence.
+        prompt_positions: global positions of the prompt (question) tokens;
+            must be contiguous and ascending.
+        context_positions: global positions eligible for recomputation; all
+            must precede the prompt.
+        score_layers: layer indices whose attention is accumulated.
+
+    Returns:
+        ``{"scores": CPU float tensor aligned with context_positions,
+        "context_positions", "prompt_positions", "layers"}`` -- the same
+        contract as ``score_prompt_to_context_attention_l0``.
+    """
+    if not prompt_positions:
+        raise ValueError("prompt_positions must be non-empty")
+    if not context_positions:
+        raise ValueError("context_positions must be non-empty")
+    score_layers = sorted({int(layer) for layer in score_layers})
+    if not score_layers:
+        raise ValueError("score_layers must be non-empty")
+    prompt_positions = list(prompt_positions)
+    prompt_start = prompt_positions[0]
+    if prompt_positions != list(range(prompt_start, prompt_start + len(prompt_positions))):
+        raise ValueError("prompt_positions must be contiguous and ascending")
+    if max(context_positions) >= prompt_start or min(context_positions) < 0:
+        raise ValueError("context_positions must all precede the prompt")
+
+    model_runner = worker.model_runner
+    llama_model = model_runner.model.model
+    layers = llama_model.layers
+    num_layers = len(layers)
+    if score_layers[-1] >= num_layers:
+        raise ValueError(
+            f"score_layers {score_layers} exceed model depth {num_layers}")
+    first = layers[0]
+    if (not hasattr(first, "input_layernorm")
+            or hasattr(first, "pre_feedforward_layernorm")):
+        raise NotImplementedError(
+            "The InfoFlow scorer supports pre-norm LLaMA-family layers only.")
+    if hasattr(first.self_attn, "_apply_qk_norm"):
+        raise NotImplementedError("qk-norm architectures are not supported.")
+
+    kv_caches = model_runner.kv_caches
+    key_cache0 = kv_caches[0][0]
+    block_size = key_cache0.shape[1]
+    num_kv_heads = key_cache0.shape[2]
+    head_dim = key_cache0.shape[3]
+    num_q_heads = first.self_attn.num_heads
+    if num_q_heads % num_kv_heads:
+        raise ValueError(
+            f"Unsupported GQA layout: {num_q_heads} Q heads / "
+            f"{num_kv_heads} KV heads")
+    groups = num_q_heads // num_kv_heads
+    device = key_cache0.device
+    scale = head_dim ** -0.5
+
+    n_prompt = len(prompt_positions)
+    prompt_positions_t = torch.tensor(prompt_positions, device=device,
+                                      dtype=torch.long)
+    prompt_ids_t = torch.tensor([token_ids[p] for p in prompt_positions],
+                                device=device, dtype=torch.long)
+    context_positions_t = torch.tensor(list(context_positions), device=device,
+                                       dtype=torch.long)
+
+    block_table_t = torch.tensor(block_table, device=device, dtype=torch.long)
+    prefix_positions = torch.arange(prompt_start, device=device, dtype=torch.long)
+    prefix_physical = block_table_t[prefix_positions // block_size]
+    prefix_offsets = prefix_positions % block_size
+
+    # Key j is visible to prompt token i iff j < prompt_start + i + 1.
+    total_keys = prompt_start + n_prompt
+    key_index = torch.arange(total_keys, device=device)
+    allowed = key_index[None, :] < (prompt_start + 1
+                                    + torch.arange(n_prompt, device=device))[:, None]
+    neg = torch.finfo(torch.float32).min
+
+    hidden_states = llama_model.embed_tokens(prompt_ids_t)
+    residual = None
+    scores = torch.zeros(len(context_positions), device=device,
+                         dtype=torch.float32)
+
+    for layer_idx in range(score_layers[-1] + 1):
+        layer = layers[layer_idx]
+        if residual is None:
+            residual = hidden_states
+            attn_input = layer.input_layernorm(hidden_states)
+        else:
+            attn_input, residual = layer.input_layernorm(hidden_states, residual)
+        qkv, _ = layer.self_attn.qkv_proj(attn_input)
+        q_size = layer.self_attn.q_size
+        kv_size = layer.self_attn.kv_size
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q, k = layer.self_attn.rotary_emb(prompt_positions_t, q, k)
+        # q heads are grouped as kv_head * groups + g (matches repeat_interleave).
+        q = q.view(n_prompt, num_kv_heads, groups, head_dim).float()
+        k = k.view(n_prompt, num_kv_heads, head_dim)
+        v = v.view(n_prompt, num_kv_heads, head_dim)
+
+        key_cache, value_cache = kv_caches[layer_idx].unbind(0)
+        keys = torch.cat([key_cache[prefix_physical, prefix_offsets], k], dim=0).float()
+        values = torch.cat([value_cache[prefix_physical, prefix_offsets], v], dim=0).float()
+
+        logits = torch.einsum("pkgd,lkd->pkgl", q, keys) * scale
+        logits = logits.masked_fill(~allowed[:, None, None, :], neg)
+        probs = torch.softmax(logits, dim=-1)
+        if layer_idx in score_layers:
+            # [prompt, kv, groups, ctx] -> mean over all query heads -> sum over prompt.
+            scores += probs[..., context_positions_t].mean(dim=(1, 2)).sum(dim=0)
+        attn_out = torch.einsum("pkgl,lkd->pkgd", probs, values)
+        attn_out = attn_out.to(hidden_states.dtype).reshape(n_prompt, -1)
+        attn_proj, _ = layer.self_attn.o_proj(attn_out)
+        hidden_states, residual = layer.post_attention_layernorm(attn_proj, residual)
+        hidden_states = layer.mlp(hidden_states)
+
+    return {
+        "scores": scores.cpu(),
+        "context_positions": list(context_positions),
+        "prompt_positions": list(prompt_positions),
+        "layers": score_layers,
+    }
+
+
 def select_infoflow_candidates(score_result, ratio=0.15):
     """Return global context positions with the largest InfoFlow scores.
 
