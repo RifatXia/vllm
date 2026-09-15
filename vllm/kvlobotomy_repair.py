@@ -631,11 +631,17 @@ def fast_compose_recompute(worker, new_seq_len, block_table,
 
     bt_t = torch.tensor(block_table, device=device, dtype=torch.long)
 
-    from vllm.v1.attention.backends.fa_utils import (
-        flash_attn_varlen_func,
-        get_flash_attn_version,
-        reshape_and_cache_flash,
-    )
+    try:
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,
+            get_flash_attn_version,
+            reshape_and_cache_flash,
+        )
+    except ImportError:
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+        from vllm.attention.utils.fa_utils import (
+            get_flash_attn_version, reshape_and_cache_flash,
+        )
     fa_version = get_flash_attn_version()
 
     # Model-family-specific scaling (Granite + Gemma). No-ops for LLaMA et al.
@@ -1113,11 +1119,17 @@ def fast_selective_recompute(worker, new_seq_len, block_table,
     scale = float(_attn_mult) if _attn_mult is not None else head_dim ** -0.5
 
     # Detect FA version for this platform
-    from vllm.v1.attention.backends.fa_utils import (
-        flash_attn_varlen_func,
-        get_flash_attn_version,
-        reshape_and_cache_flash,
-    )
+    try:
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,
+            get_flash_attn_version,
+            reshape_and_cache_flash,
+        )
+    except ImportError:
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+        from vllm.attention.utils.fa_utils import (
+            get_flash_attn_version, reshape_and_cache_flash,
+        )
     fa_version = get_flash_attn_version()
     assert fa_version is not None, "FlashAttention not available on this platform"
 
@@ -1343,3 +1355,55 @@ def fast_selective_recompute(worker, new_seq_len, block_table,
     if _profile:
         result["_stage_ms"] = _stage_ms
     return result
+
+
+def select_facts_and_question(c_len, f3_span, q_span, ratio=0.15):
+    """Content-aware repair selector — v5 §3.2.
+
+    Position-only selectors (`select_tail_contiguous`) waste most of the
+    budget on filler tokens at small ratios. This selector explicitly
+    targets the tokens that participate in the multi-hop chain — F3 (the
+    third-hop prose) and Q (the question) — and fills any remaining budget
+    with tail tokens.
+
+    Args:
+        c_len: length of the post-edit C region (= tokens after surgery point).
+        f3_span: (start, end) tuple in c-relative coordinates; None if F3 was
+                 not found by the runner.
+        q_span:  (start, end) tuple in c-relative coordinates; None if Q was
+                 not found.
+        ratio: fraction of C to repair.
+
+    Returns:
+        Sorted list of c-relative token indices, |result| == int(c_len * ratio)
+        (or 1 if ratio is tiny).
+    """
+    budget = max(1, int(c_len * ratio))
+    budget = min(budget, c_len)
+
+    must = set()
+    if f3_span is not None:
+        s, e = f3_span
+        s = max(0, int(s))
+        e = min(int(e), c_len)
+        if e > s:
+            must.update(range(s, e))
+    if q_span is not None:
+        s, e = q_span
+        s = max(0, int(s))
+        e = min(int(e), c_len)
+        if e > s:
+            must.update(range(s, e))
+
+    if len(must) >= budget:
+        return sorted(must)[-budget:]
+
+    remaining = budget - len(must)
+    fill = []
+    for i in range(c_len - 1, -1, -1):
+        if i in must:
+            continue
+        fill.append(i)
+        if len(fill) >= remaining:
+            break
+    return sorted(must | set(fill))

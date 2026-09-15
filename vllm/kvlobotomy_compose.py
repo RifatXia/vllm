@@ -1125,10 +1125,17 @@ def _prefill_independent_contiguous(worker, token_ids, head_dim):
         keys: dict[layer_idx] -> [N, kv_heads, head_dim]
         values: dict[layer_idx] -> [N, kv_heads, head_dim]
     """
-    from vllm.v1.attention.backends.fa_utils import (
-        flash_attn_varlen_func,
-        get_flash_attn_version,
-    )
+    # vllm 0.13: vllm.v1.attention.backends.fa_utils has both.
+    # vllm 0.11: split — flash_attn_varlen_func in vllm_flash_attn,
+    # get_flash_attn_version in vllm.attention.utils.fa_utils.
+    try:
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,
+            get_flash_attn_version,
+        )
+    except ImportError:
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+        from vllm.attention.utils.fa_utils import get_flash_attn_version
 
     model_runner = worker.model_runner
     llama_model = model_runner.model.model

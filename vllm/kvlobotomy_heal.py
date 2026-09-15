@@ -104,8 +104,14 @@ def get_physical_block_table(
     """
     core = _get_engine_core(llm)
     block_pool = core.scheduler.kv_cache_manager.block_pool
-    block_size = block_pool.hash_block_size
-    hash_fn = core.caching_hash_fn
+    # vllm 0.13 stores hash_block_size on block_pool; vllm 0.11 stores it
+    # on kv_cache_manager (one level up). caching_hash_fn was a local var in
+    # vllm 0.11's EngineCore.__init__, not exposed; recompute from config.
+    block_size = getattr(block_pool, 'hash_block_size', None) or core.scheduler.kv_cache_manager.block_size
+    hash_fn = getattr(core, 'caching_hash_fn', None)
+    if hash_fn is None:
+        from vllm.utils import get_hash_fn_by_name
+        hash_fn = get_hash_fn_by_name(core.vllm_config.cache_config.prefix_caching_hash_algo)
 
     if hash_fn is None:
         raise RuntimeError("Prefix caching hash function not available.")
@@ -291,7 +297,14 @@ def release_surgery_blocks(llm, block_table: list[int]) -> dict:
     # Phase 1: evict from cache hash table. This removes block_hash entries
     # so subsequent lookups miss. evict_blocks only drops cached blocks;
     # blocks with ref_cnt > 0 remain allocated until we free them below.
-    block_pool.evict_blocks(set(unique_ids))
+    # vllm 0.13: block_pool.evict_blocks(set_of_ids)
+    # vllm 0.11: per-block via _maybe_evict_cached_block(KVCacheBlock)
+    if hasattr(block_pool, 'evict_blocks'):
+        block_pool.evict_blocks(set(unique_ids))
+    else:
+        for bid in unique_ids:
+            if 0 <= bid < len(all_blocks):
+                block_pool._maybe_evict_cached_block(all_blocks[bid])
 
     # Phase 2: decrement ref_cnt and return to free queue when ref_cnt == 0.
     # The block objects in block_pool.blocks are indexed by block_id.
@@ -336,8 +349,14 @@ def heal_prefix_cache_after_delete(
     """
     core = _get_engine_core(llm)
     block_pool = core.scheduler.kv_cache_manager.block_pool
-    block_size = block_pool.hash_block_size
-    hash_fn = core.caching_hash_fn
+    # vllm 0.13 stores hash_block_size on block_pool; vllm 0.11 stores it
+    # on kv_cache_manager (one level up). caching_hash_fn was a local var in
+    # vllm 0.11's EngineCore.__init__, not exposed; recompute from config.
+    block_size = getattr(block_pool, 'hash_block_size', None) or core.scheduler.kv_cache_manager.block_size
+    hash_fn = getattr(core, 'caching_hash_fn', None)
+    if hash_fn is None:
+        from vllm.utils import get_hash_fn_by_name
+        hash_fn = get_hash_fn_by_name(core.vllm_config.cache_config.prefix_caching_hash_algo)
 
     if hash_fn is None:
         raise RuntimeError(
@@ -488,8 +507,14 @@ def heal_prefix_cache_after_replace(
     """
     core = _get_engine_core(llm)
     block_pool = core.scheduler.kv_cache_manager.block_pool
-    block_size = block_pool.hash_block_size
-    hash_fn = core.caching_hash_fn
+    # vllm 0.13 stores hash_block_size on block_pool; vllm 0.11 stores it
+    # on kv_cache_manager (one level up). caching_hash_fn was a local var in
+    # vllm 0.11's EngineCore.__init__, not exposed; recompute from config.
+    block_size = getattr(block_pool, 'hash_block_size', None) or core.scheduler.kv_cache_manager.block_size
+    hash_fn = getattr(core, 'caching_hash_fn', None)
+    if hash_fn is None:
+        from vllm.utils import get_hash_fn_by_name
+        hash_fn = get_hash_fn_by_name(core.vllm_config.cache_config.prefix_caching_hash_algo)
 
     if hash_fn is None:
         raise RuntimeError(
